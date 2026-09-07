@@ -58,6 +58,12 @@ func (s *Server) adminImport9routerSQLite(w http.ResponseWriter, r *http.Request
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
+	defer func() {
+		// A WAL-mode upload leaves -wal/-shm siblings when opened; remove them
+		// with the temp file so the data dir stays clean.
+		_ = os.Remove(tmpPath + "-wal")
+		_ = os.Remove(tmpPath + "-shm")
+	}()
 
 	if _, err := tmp.ReadFrom(file); err != nil {
 		_ = tmp.Close()
@@ -128,7 +134,43 @@ func read9routerSQLiteDoc(ctx context.Context, path string) (map[string]json.Raw
 		}
 		doc[t] = raw
 	}
+	// proxyPools keeps name/proxyUrl/type/strictProxy inside the nested `data`
+	// JSON column; the JSON export flattens them and the importer reads the
+	// flat shape. Merge `data` fields to the top level to match.
+	flattenNestedData(doc, "proxyPools")
 	return doc, nil
+}
+
+// flattenNestedData merges the parsed `data` JSON column of every row in the
+// given table into the row's top level (without clobbering existing keys).
+func flattenNestedData(doc map[string]json.RawMessage, table string) {
+	raw, ok := doc[table]
+	if !ok {
+		return
+	}
+	var rows []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return
+	}
+	for _, row := range rows {
+		dataRaw, ok := row["data"]
+		if !ok {
+			continue
+		}
+		var data map[string]json.RawMessage
+		if err := json.Unmarshal(dataRaw, &data); err != nil {
+			continue
+		}
+		delete(row, "data")
+		for k, v := range data {
+			if _, exists := row[k]; !exists {
+				row[k] = v
+			}
+		}
+	}
+	if b, err := json.Marshal(rows); err == nil {
+		doc[table] = b
+	}
 }
 
 // readTableAsJSON returns a JSON array of row objects for the given table, or
@@ -214,19 +256,36 @@ func looksLikeJSON(s string) bool {
 
 // n9routerUsageRow is one 9router usageHistory row.
 type n9routerUsageRow struct {
-	ID               int64   `json:"id"`
-	Timestamp        string  `json:"timestamp"`
-	Provider         string  `json:"provider"`
-	Model            string  `json:"model"`
-	ConnectionID     string  `json:"connectionId"`
-	APIKey           string  `json:"apiKey"`
-	Endpoint         string  `json:"endpoint"`
-	PromptTokens     int     `json:"promptTokens"`
-	CompletionTokens int     `json:"completionTokens"`
-	Cost             float64 `json:"cost"`
-	Status           string  `json:"status"`
-	Tokens           string  `json:"tokens"`
-	Meta             string  `json:"meta"`
+	ID               int64           `json:"id"`
+	Timestamp        string          `json:"timestamp"`
+	Provider         string          `json:"provider"`
+	Model            string          `json:"model"`
+	ConnectionID     string          `json:"connectionId"`
+	APIKey           string          `json:"apiKey"`
+	Endpoint         string          `json:"endpoint"`
+	PromptTokens     int             `json:"promptTokens"`
+	CompletionTokens int             `json:"completionTokens"`
+	Cost             float64         `json:"cost"`
+	Status           string          `json:"status"`
+	Tokens           json.RawMessage `json:"tokens"`
+	Meta             json.RawMessage `json:"meta"`
+}
+
+// decode9routerJSONCol decodes a column that may arrive either as a JSON
+// string containing JSON (the JSON export path) or as an already-parsed JSON
+// object (the SQLite reader path).
+func decode9routerJSONCol(raw json.RawMessage, target any) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if strings.TrimSpace(s) == "" {
+			return nil
+		}
+		return json.Unmarshal([]byte(s), target)
+	}
+	return json.Unmarshal(raw, target)
 }
 
 // import9routerUsageHistory migrates 9router usageHistory rows into
@@ -274,14 +333,14 @@ func (s *Server) import9routerUsageHistory(ctx context.Context, doc map[string]j
 		rec.UsageSource = "provider"
 
 		// tokens JSON carries cached/reasoning/cache-write breakdown.
-		if r.Tokens != "" {
+		if len(r.Tokens) > 0 {
 			var tk struct {
 				CachedTokens     int `json:"cached_tokens"`
 				CacheReadTokens  int `json:"cache_read_input_tokens"`
 				CacheWriteTokens int `json:"cache_creation_input_tokens"`
 				ReasoningTokens  int `json:"reasoning_tokens"`
 			}
-			if err := json.Unmarshal([]byte(r.Tokens), &tk); err == nil {
+			if err := decode9routerJSONCol(r.Tokens, &tk); err == nil {
 				rec.CachedTokens = tk.CachedTokens
 				if rec.CachedTokens == 0 {
 					rec.CachedTokens = tk.CacheReadTokens
@@ -292,14 +351,14 @@ func (s *Server) import9routerUsageHistory(ctx context.Context, doc map[string]j
 		}
 
 		// meta JSON carries client/request_id/latency.
-		if r.Meta != "" && r.Meta != "{}" {
+		if len(r.Meta) > 0 && string(r.Meta) != "{}" && string(r.Meta) != `"{}"` {
 			var m struct {
 				Client    string `json:"client"`
 				RequestID string `json:"request_id"`
 				LatencyMS int    `json:"latency_ms"`
 				TTFTMS    int    `json:"ttft_ms"`
 			}
-			if err := json.Unmarshal([]byte(r.Meta), &m); err == nil {
+			if err := decode9routerJSONCol(r.Meta, &m); err == nil {
 				rec.Client = m.Client
 				rec.RequestID = m.RequestID
 				rec.LatencyMS = m.LatencyMS
