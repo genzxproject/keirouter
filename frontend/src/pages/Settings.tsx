@@ -1223,6 +1223,7 @@ function ForeignImportSettings() {
   const toast = useToast();
   const import9rRef = useRef<HTMLInputElement>(null);
   const importOmniRef = useRef<HTMLInputElement>(null);
+  const importSqliteRef = useRef<HTMLInputElement>(null);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<ForeignImportResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1266,6 +1267,36 @@ function ForeignImportSettings() {
     const file = e.target.files?.[0];
     if (file) void runImport("omniroute", file);
     if (importOmniRef.current) importOmniRef.current.value = "";
+  };
+
+  const handleSqliteFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    try {
+      const res = await api.import9routerSQLite(file);
+      setResult(res);
+      const parts: string[] = [];
+      if (res.accounts) parts.push(`${res.accounts} account${res.accounts === 1 ? "" : "s"}`);
+      if (res.custom_providers) parts.push(`${res.custom_providers} provider${res.custom_providers === 1 ? "" : "s"}`);
+      if (res.api_keys) parts.push(`${res.api_keys} key${res.api_keys === 1 ? "" : "s"}`);
+      if (res.chains) parts.push(`${res.chains} chain${res.chains === 1 ? "" : "s"}`);
+      if (res.aliases) parts.push(`${res.aliases} alias${res.aliases === 1 ? "" : "es"}`);
+      if (res.proxy_pools) parts.push(`${res.proxy_pools} pool${res.proxy_pools === 1 ? "" : "s"}`);
+      const summary = parts.length ? parts.join(", ") : "nothing";
+      toast.success(
+        "9router SQLite import complete",
+        `${res.imported} record${res.imported === 1 ? "" : "s"} imported (${summary}).${res.skipped ? ` ${res.skipped} skipped.` : ""}`,
+      );
+    } catch (e) {
+      setError((e as Error).message || "Import failed.");
+      toast.error("Import failed", (e as Error).message);
+    } finally {
+      setLoading(false);
+      if (importSqliteRef.current) importSqliteRef.current.value = "";
+    }
   };
 
   return (
@@ -1330,6 +1361,35 @@ function ForeignImportSettings() {
             accept="application/json,.json"
             className="hidden"
             onChange={handleOmniFile}
+          />
+        </div>
+
+        {/* 9router SQLite direct import */}
+        <div className="flex flex-col gap-3 rounded-xl border border-[var(--border)] bg-[var(--bg)] p-4 sm:col-span-2">
+          <div className="flex items-center gap-2">
+            <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-accent-100 text-xs font-bold text-accent-700 dark:bg-accent-900/40 dark:text-accent-200">
+              DB
+            </span>
+            <div>
+              <p className="text-sm font-semibold text-[var(--text)]">9router SQLite database</p>
+              <p className="text-[11px] text-[var(--text-muted)]">Full import incl. usage history &amp; settings</p>
+            </div>
+          </div>
+          <p className="text-xs leading-relaxed text-[var(--text-muted)]">
+            Upload 9router's <code>data.sqlite</code> directly. Imports everything the JSON backup does, plus usage
+            history (60k+ rows), token saver settings (RTK/Caveman/Ponytail), routing strategy, and the dashboard
+            password. Requires SQLite driver.
+          </p>
+          <Button variant="ghost" onClick={() => importSqliteRef.current?.click()} disabled={loading} className="w-full">
+            <Upload className="h-4 w-4" />
+            Select 9router data.sqlite
+          </Button>
+          <input
+            ref={importSqliteRef}
+            type="file"
+            accept=".sqlite,.db,application/vnd.sqlite3,application/x-sqlite3"
+            className="hidden"
+            onChange={handleSqliteFile}
           />
         </div>
       </div>

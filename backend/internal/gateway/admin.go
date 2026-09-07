@@ -110,6 +110,7 @@ func (s *Server) mountAdmin(r chi.Router) {
 	r.Get("/settings/database", s.adminExportDatabase)
 	r.Post("/settings/database", s.adminImportDatabase)
 	r.Post("/settings/database/import-foreign", s.adminImportForeignConfig)
+	r.Post("/settings/database/import-9router-sqlite", s.adminImport9routerSQLite)
 	r.Get("/settings/sqlite", s.adminSQLiteStatus)
 	r.Get("/settings/sqlite/backup", s.adminSQLiteBackup)
 	r.Post("/settings/sqlite/restore", s.adminSQLiteRestore)

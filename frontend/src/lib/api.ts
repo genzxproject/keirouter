@@ -1433,6 +1433,12 @@ export const api = {
     body.append("file", file);
     return requestForm<SQLiteRestoreResult>("POST", "/settings/sqlite/restore", body);
   },
+  // Import 9router SQLite database directly (usageHistory, apiKeys, providers, proxyPools, settings).
+  import9routerSQLite: (file: File) => {
+    const body = new FormData();
+    body.append("file", file);
+    return requestForm<ForeignImportResult>("POST", "/settings/database/import-9router-sqlite", body);
+  },
 
   // Proxy test.
   testProxy: (proxyUrl: string) =>
