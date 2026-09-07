@@ -32,6 +32,7 @@ func (s *Server) adminImport9routerSQLite(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "9router SQLite import requires database.driver=sqlite")
 		return
 	}
+	started := time.Now()
 
 	r.Body = http.MaxBytesReader(w, r.Body, sqliteBackupMaxBytes)
 	if err := r.ParseMultipartForm(sqliteBackupMaxBytes); err != nil {
@@ -95,11 +96,21 @@ func (s *Server) adminImport9routerSQLite(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "read 9router database: "+err.Error())
 		return
 	}
+	s.log.Info("9router import: database read", "elapsed_ms", time.Since(started).Milliseconds())
 
 	res := &foreignImportResult{Source: "9router"}
 	s.importN9router(ctx, doc, res)
+	s.log.Info("9router import: config tables", "elapsed_ms", time.Since(started).Milliseconds(),
+		"accounts", res.Accounts, "custom_providers", res.CustomProviders,
+		"api_keys", res.APIKeys, "chains", res.Chains, "proxy_pools", res.ProxyPools)
+
 	s.import9routerUsageHistory(ctx, doc, res)
+	s.log.Info("9router import: usage records", "elapsed_ms", time.Since(started).Milliseconds(),
+		"usage_records", res.UsageRecords)
+
 	s.import9routerSettings(ctx, doc, res)
+	s.log.Info("9router import: complete", "elapsed_ms", time.Since(started).Milliseconds(),
+		"errors", len(res.Errors))
 
 	res.Imported = res.Accounts + res.CustomProviders + res.APIKeys + res.Chains + res.Aliases + res.ProxyPools
 	writeJSON(w, http.StatusOK, res)
@@ -392,7 +403,7 @@ func (s *Server) import9routerUsageHistory(ctx context.Context, doc map[string]j
 		}
 		imported = end
 	}
-	res.Errors = append(res.Errors, fmt.Sprintf("usageHistory: imported %d rows", imported))
+	res.UsageRecords = imported
 }
 
 // usageKeyLookup builds a map from api_key lookup_hash → api_key id for the

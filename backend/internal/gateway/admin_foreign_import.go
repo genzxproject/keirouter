@@ -44,6 +44,7 @@ type foreignImportResult struct {
 	Chains          int      `json:"chains"`
 	Aliases         int      `json:"aliases"`
 	ProxyPools      int      `json:"proxy_pools"`
+	UsageRecords    int      `json:"usage_records,omitempty"`
 	Errors          []string `json:"errors,omitempty"`
 }
 
