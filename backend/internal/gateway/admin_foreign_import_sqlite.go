@@ -285,11 +285,22 @@ func (s *Server) import9routerUsageHistory(ctx context.Context, doc map[string]j
 		records = append(records, rec)
 	}
 
-	if err := s.usage.RecordBatch(ctx, records); err != nil {
-		res.Errors = append(res.Errors, "usageHistory: "+err.Error())
-		return
+	// Insert in chunks so each transaction stays short: one 60k-row
+	// transaction holds the SQLite write lock for the whole import and starves
+	// background writers (health checks, resource samples) with SQLITE_BUSY.
+	// RecordBatch already splits statements to respect bind limits; chunking
+	// here additionally bounds transaction duration.
+	const chunkSize = 1000
+	imported := 0
+	for start := 0; start < len(records); start += chunkSize {
+		end := min(start+chunkSize, len(records))
+		if err := s.usage.RecordBatch(ctx, records[start:end]); err != nil {
+			res.Errors = append(res.Errors, fmt.Sprintf("usageHistory: %d/%d rows: %v", start, len(records), err))
+			break
+		}
+		imported = end
 	}
-	res.Errors = append(res.Errors, fmt.Sprintf("usageHistory: imported %d rows", len(records)))
+	res.Errors = append(res.Errors, fmt.Sprintf("usageHistory: imported %d rows", imported))
 }
 
 // usageKeyLookup builds a map from api_key lookup_hash → api_key id for the

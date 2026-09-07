@@ -1086,9 +1086,10 @@ async function requestBlob(method: string, path: string): Promise<Blob> {
 }
 
 async function requestForm<T>(method: string, path: string, body: FormData): Promise<T> {
-  // Uploads (e.g. SQLite restore) can legitimately take longer than a JSON
-  // call, so allow a more generous deadline than the default.
-  const res = await fetchWithTimeout(`/api${path}`, { method, body }, 60_000);
+  // Uploads can legitimately take longer than a JSON call: a 9router SQLite
+  // import uploads tens of MB and converts 60k+ usage rows. Use the largest
+  // supported timeout and let callers with smaller payloads finish early.
+  const res = await fetchWithTimeout(`/api${path}`, { method, body }, 300_000);
   if (!res.ok) {
     let message = res.statusText;
     try {
