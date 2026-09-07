@@ -154,6 +154,18 @@ func readTableAsJSON(ctx context.Context, db *sql.DB, table string) (json.RawMes
 		return nil, err
 	}
 
+	// 9router stores booleans as SQLite INTEGER (0/1) and nested config as
+	// JSON strings (e.g. providerNodes.data, combos.models). The JSON importer
+	// structs expect real bools/arrays, so normalize while building each row:
+	// INTEGER 0/1 → JSON bool, JSON-looking strings → embedded JSON values.
+	intCols := make([]bool, len(cols))
+	for i, c := range cols {
+		switch c {
+		case "isActive", "disabled", "enabled", "strictProxy":
+			intCols[i] = true
+		}
+	}
+
 	out := make([]map[string]any, 0)
 	scan := make([]any, len(cols))
 	scanPtrs := make([]any, len(cols))
@@ -166,7 +178,21 @@ func readTableAsJSON(ctx context.Context, db *sql.DB, table string) (json.RawMes
 		}
 		obj := make(map[string]any, len(cols))
 		for i, c := range cols {
-			obj[c] = scan[i]
+			v := scan[i]
+			if intCols[i] {
+				if n, ok := v.(int64); ok {
+					obj[c] = n != 0
+					continue
+				}
+			}
+			if s, ok := v.(string); ok && looksLikeJSON(s) {
+				var parsed any
+				if err := json.Unmarshal([]byte(s), &parsed); err == nil {
+					obj[c] = parsed
+					continue
+				}
+			}
+			obj[c] = v
 		}
 		out = append(out, obj)
 	}
@@ -175,6 +201,13 @@ func readTableAsJSON(ctx context.Context, db *sql.DB, table string) (json.RawMes
 	}
 
 	return json.Marshal(out)
+}
+
+// looksLikeJSON reports whether s starts like a JSON object or array (9router
+// JSON-string columns such as data/models/tokens/meta always do).
+func looksLikeJSON(s string) bool {
+	s = strings.TrimSpace(s)
+	return len(s) > 1 && (s[0] == '{' || s[0] == '[')
 }
 
 // ── usageHistory → usage_records ──────────────────────────────────────────
