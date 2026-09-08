@@ -1001,8 +1001,22 @@ export interface ForeignImportResult {
   chains: number;
   aliases: number;
   proxy_pools: number;
+  usage_records?: number;
   errors?: string[];
 }
+export interface N9routerImportOptions {
+  usage: boolean;
+  providers: boolean;
+  api_keys: boolean;
+  proxy_pools: boolean;
+  chains: boolean;
+  settings: boolean;
+  password: boolean;
+  mode: "merge" | "overwrite" | "wipe";
+}
+export type N9routerAnalyzeResult = Partial<
+  Record<"providerNodes" | "providerConnections" | "apiKeys" | "combos" | "proxyPools" | "usageHistory", number>
+>;
 
 class APIError extends Error {
   status: number;
@@ -1435,10 +1449,17 @@ export const api = {
     return requestForm<SQLiteRestoreResult>("POST", "/settings/sqlite/restore", body);
   },
   // Import 9router SQLite database directly (usageHistory, apiKeys, providers, proxyPools, settings).
-  import9routerSQLite: (file: File) => {
+  import9routerSQLite: (file: File, options?: Partial<N9routerImportOptions>) => {
     const body = new FormData();
     body.append("file", file);
+    if (options) body.append("options", JSON.stringify(options));
     return requestForm<ForeignImportResult>("POST", "/settings/database/import-9router-sqlite", body);
+  },
+  // Analyze a 9router SQLite upload: per-table row counts, nothing written.
+  analyze9routerSQLite: (file: File) => {
+    const body = new FormData();
+    body.append("file", file);
+    return requestForm<N9routerAnalyzeResult>("POST", "/settings/database/analyze-9router-sqlite", body);
   },
 
   // Proxy test.

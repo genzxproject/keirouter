@@ -27,12 +27,140 @@ import (
 // Unlike the JSON path, this also migrates usageHistory (usage_records) and the
 // settings blob (token saver / routing / dashboard password), which the JSON
 // export does not carry.
+//
+// n9IDPrefix marks rows imported from 9router so re-imports can replace them
+// without touching KeiRouter-native rows.
+const n9IDPrefix = "n9:"
+
+// n9routerImportOptions controls which sections are imported and how existing
+// data interacts with the incoming rows.
+type n9routerImportOptions struct {
+	// Sections.
+	Usage      bool `json:"usage"`
+	Providers  bool `json:"providers"`
+	APIKeys    bool `json:"api_keys"`
+	ProxyPools bool `json:"proxy_pools"`
+	Chains     bool `json:"chains"`
+	Settings   bool `json:"settings"`
+	Password   bool `json:"password"`
+	// Mode: "merge" (skip existing), "overwrite" (delete previous n9: rows
+	// for selected sections first), "wipe" (delete ALL rows in selected
+	// sections, including KeiRouter-native data).
+	Mode string `json:"mode"`
+}
+
+// defaultN9routerImportOptions returns all sections enabled in merge mode.
+func defaultN9routerImportOptions() n9routerImportOptions {
+	return n9routerImportOptions{
+		Usage: true, Providers: true, APIKeys: true, ProxyPools: true,
+		Chains: true, Settings: true, Password: true,
+		Mode: "merge",
+	}
+}
+
+// adminAnalyze9routerSQLite reads the uploaded 9router database and returns
+// per-table row counts so the UI can render an informed confirmation before
+// the actual import. Nothing is written.
+func (s *Server) adminAnalyze9routerSQLite(w http.ResponseWriter, r *http.Request) {
+	counts, err := s.analyze9routerUpload(w, r)
+	if err != nil {
+		return // response already written
+	}
+	writeJSON(w, http.StatusOK, counts)
+}
+
+// analyze9routerUpload performs the shared upload+validate+count steps for
+// both the analyze and import endpoints.
+func (s *Server) analyze9routerUpload(w http.ResponseWriter, r *http.Request) (map[string]int64, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, sqliteBackupMaxBytes)
+	if err := r.ParseMultipartForm(sqliteBackupMaxBytes); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid upload: "+err.Error())
+		return nil, err
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "file is required")
+		return nil, err
+	}
+	defer file.Close()
+	if header.Size <= 0 {
+		writeError(w, http.StatusBadRequest, "uploaded file is empty")
+		return nil, fmt.Errorf("empty file")
+	}
+	tmp, err := os.CreateTemp(s.dataDirOrTemp(), "keirouter-9router-import-*.sqlite")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "create temp file failed: "+err.Error())
+		return nil, err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	defer func() {
+		// A WAL-mode upload leaves -wal/-shm siblings when opened; remove them
+		// with the temp file so the data dir stays clean.
+		_ = os.Remove(tmpPath + "-wal")
+		_ = os.Remove(tmpPath + "-shm")
+	}()
+	if _, err := tmp.ReadFrom(file); err != nil {
+		_ = tmp.Close()
+		writeError(w, http.StatusInternalServerError, "save upload failed: "+err.Error())
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		writeError(w, http.StatusInternalServerError, "close upload failed: "+err.Error())
+		return nil, err
+	}
+	if err := validateSQLiteFile(r.Context(), tmpPath); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid SQLite database: "+err.Error())
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	db, err := sql.Open("sqlite", "file:"+tmpPath+"?mode=ro")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "open 9router database: "+err.Error())
+		return nil, err
+	}
+	defer db.Close()
+	counts := map[string]int64{}
+	for _, t := range []string{"providerNodes", "providerConnections", "apiKeys", "combos", "proxyPools", "usageHistory"} {
+		var exists int
+		if err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", t).Scan(&exists); err != nil {
+			writeError(w, http.StatusBadRequest, "read 9router database: "+err.Error())
+			return nil, err
+		}
+		if exists == 0 {
+			continue
+		}
+		var n int64
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+t).Scan(&n); err == nil {
+			counts[t] = n
+		}
+	}
+	return counts, nil
+}
+
 func (s *Server) adminImport9routerSQLite(w http.ResponseWriter, r *http.Request) {
 	if s.dbDialect() != store.DialectSQLite {
 		writeError(w, http.StatusBadRequest, "9router SQLite import requires database.driver=sqlite")
 		return
 	}
 	started := time.Now()
+
+	// Options arrive as a JSON form field alongside the file.
+	opts := defaultN9routerImportOptions()
+	if raw := r.FormValue("options"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &opts); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid options: "+err.Error())
+			return
+		}
+	}
+	switch opts.Mode {
+	case "merge", "overwrite", "wipe":
+	default:
+		writeError(w, http.StatusBadRequest, "mode must be merge, overwrite, or wipe")
+		return
+	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, sqliteBackupMaxBytes)
 	if err := r.ParseMultipartForm(sqliteBackupMaxBytes); err != nil {
@@ -98,22 +226,93 @@ func (s *Server) adminImport9routerSQLite(w http.ResponseWriter, r *http.Request
 	}
 	s.log.Info("9router import: database read", "elapsed_ms", time.Since(started).Milliseconds())
 
+	// Wipe mode destroys ALL rows in the selected sections (including
+	// KeiRouter-native data). Take a safety backup first so the operator can
+	// recover; overwrite mode only removes previous n9: rows, which the
+	// re-import recreates, so no backup is needed there.
+	if opts.Mode == "wipe" {
+		if err := s.n9routerSafetyBackup(); err != nil {
+			writeError(w, http.StatusInternalServerError, "safety backup failed: "+err.Error())
+			return
+		}
+	}
 	res := &foreignImportResult{Source: "9router"}
-	s.importN9router(ctx, doc, res)
-	s.log.Info("9router import: config tables", "elapsed_ms", time.Since(started).Milliseconds(),
-		"accounts", res.Accounts, "custom_providers", res.CustomProviders,
-		"api_keys", res.APIKeys, "chains", res.Chains, "proxy_pools", res.ProxyPools)
+	if opts.Mode != "merge" {
+		s.delete9routerRows(ctx, opts, res)
+	}
 
-	s.import9routerUsageHistory(ctx, doc, res)
-	s.log.Info("9router import: usage records", "elapsed_ms", time.Since(started).Milliseconds(),
-		"usage_records", res.UsageRecords)
-
-	s.import9routerSettings(ctx, doc, res)
+	if opts.Providers {
+		s.importN9router(ctx, doc, res) // nodes + connections + keys + combos + pools + aliases + custom models
+	}
+	if opts.Usage {
+		s.import9routerUsageHistory(ctx, doc, res)
+	}
+	if opts.Settings {
+		s.import9routerSettings(ctx, doc, res, opts.Password)
+	}
 	s.log.Info("9router import: complete", "elapsed_ms", time.Since(started).Milliseconds(),
-		"errors", len(res.Errors))
+		"mode", opts.Mode, "accounts", res.Accounts, "custom_providers", res.CustomProviders,
+		"api_keys", res.APIKeys, "chains", res.Chains, "proxy_pools", res.ProxyPools,
+		"usage_records", res.UsageRecords, "errors", len(res.Errors))
 
 	res.Imported = res.Accounts + res.CustomProviders + res.APIKeys + res.Chains + res.Aliases + res.ProxyPools
 	writeJSON(w, http.StatusOK, res)
+}
+
+// n9routerSafetyBackup copies the live SQLite database to a timestamped
+// safety file before destructive (wipe-mode) imports.
+func (s *Server) n9routerSafetyBackup() error {
+	path, ok := s.sqliteDBPath()
+	if !ok {
+		return fmt.Errorf("sqlite database path unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := s.checkpointSQLite(ctx); err != nil {
+		return err
+	}
+	safetyPath := path + ".before-9router-import-" + time.Now().UTC().Format("20060102-150405")
+	return copyFile(path, safetyPath)
+}
+
+// delete9routerRows removes previously imported 9router rows before a
+// re-import. Overwrite mode deletes only rows carrying the n9: id prefix;
+// wipe mode deletes every row in the selected sections.
+func (s *Server) delete9routerRows(ctx context.Context, opts n9routerImportOptions, res *foreignImportResult) {
+	onlyN9 := opts.Mode == "overwrite"
+	del := func(table, idCol string) {
+		q := "DELETE FROM " + table
+		if onlyN9 {
+			q += " WHERE " + idCol + " LIKE '" + n9IDPrefix + "%'"
+		}
+		if _, err := s.db.SQL().ExecContext(ctx, q); err != nil {
+			res.Errors = append(res.Errors, fmt.Sprintf("delete %s: %v", table, err))
+		}
+	}
+	if opts.Usage {
+		del("usage_records", "id")
+	}
+	if opts.Providers {
+		del("accounts", "id")
+	}
+	if opts.APIKeys {
+		del("api_keys", "id")
+	}
+	if opts.ProxyPools {
+		del("proxy_pools", "id")
+	}
+	if opts.Chains {
+		del("chains", "id")
+	}
+	if opts.Settings {
+		// Settings are keyed, not prefixed; reset the imported keys so the
+		// incoming blob lands cleanly.
+		for _, k := range []string{endpointSettingsKey, "auth.password_hash"} {
+			_ = s.settings.Delete(ctx, k)
+		}
+		_, _ = s.db.SQL().ExecContext(ctx,
+			"DELETE FROM settings WHERE key LIKE '"+providerRoutingPrefix+"%'")
+	}
 }
 
 // read9routerSQLiteDoc opens the 9router SQLite file read-only and returns a
@@ -320,11 +519,13 @@ func (s *Server) import9routerUsageHistory(ctx context.Context, doc map[string]j
 	records := make([]store.UsageRecord, 0, len(rows))
 	for _, r := range rows {
 		rec := store.UsageRecord{
-			ID:        strconv.FormatInt(r.ID, 10),
-			TenantID:  adminTenant,
-			Provider:  xform9routerProvider(r.Provider),
-			Model:     r.Model,
-			AccountID: r.ConnectionID,
+			ID:       strconv.FormatInt(r.ID, 10),
+			TenantID: adminTenant,
+			Provider: xform9routerProvider(r.Provider),
+			Model:    r.Model,
+			// Deterministic account id: matches the n9:-prefixed account row
+			// created by the connections importer.
+			AccountID: n9IDPrefix + r.ConnectionID,
 			Status:    map9routerUsageStatus(r.Status),
 		}
 		if ts := parseRFC3339(r.Timestamp); ts != nil {
@@ -463,11 +664,11 @@ func map9routerUsageStatus(s string) string {
 
 // import9routerSettings migrates the 9router settings blob into KeiRouter's
 // endpoint_settings (token saver + routing strategy), per-provider routing
-// overrides, and the dashboard password.
+// overrides, and optionally the dashboard password.
 //
 // Settings are additive: existing keys are overwritten only if the imported
 // value is non-zero, so manual tweaks are preserved when re-importing.
-func (s *Server) import9routerSettings(ctx context.Context, doc map[string]json.RawMessage, res *foreignImportResult) {
+func (s *Server) import9routerSettings(ctx context.Context, doc map[string]json.RawMessage, res *foreignImportResult, includePassword bool) {
 	raw, ok := doc["settings"]
 	if !ok {
 		return
@@ -502,7 +703,9 @@ func (s *Server) import9routerSettings(ctx context.Context, doc map[string]json.
 	s.import9routerRouting(ctx, data, res)
 
 	// ── Patch 7: dashboard password bcrypt → argon2id ─────────────────
-	s.import9routerPassword(ctx, data, res)
+	if includePassword {
+		s.import9routerPassword(ctx, data, res)
+	}
 }
 
 // import9routerTokenSaver maps 9router's rtk/caveman/ponytail/headroom
