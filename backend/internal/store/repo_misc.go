@@ -80,6 +80,15 @@ func (r *SettingsRepo) Set(ctx context.Context, key, value string) error {
 	return nil
 }
 
+// Delete removes a setting key. Absent keys are not an error.
+func (r *SettingsRepo) Delete(ctx context.Context, key string) error {
+	q := r.db.rebind(`DELETE FROM settings WHERE key = ?`)
+	if _, err := r.db.sql.ExecContext(ctx, q, key); err != nil {
+		return fmt.Errorf("store: delete setting: %w", err)
+	}
+	return nil
+}
+
 // AuditRepo appends and reads audit entries.
 type AuditRepo struct{ db *DB }
 

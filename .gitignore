@@ -1,6 +1,8 @@
 # Reference material (not part of KeiRouter source)
 _research/
 docs/
+9router-import
+out_inspect.txt
 
 # Go
 backend/bin/

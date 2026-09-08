@@ -103,12 +103,24 @@ func (s *Service) loadOrCreateSigningKey(ctx context.Context) ([]byte, error) {
 }
 
 // VerifyPassword reports whether the given password matches the stored hash.
+// A successful match against an imported bcrypt hash ($2a$/$2b$) is lazily
+// upgraded to the native argon2id verifier so subsequent logins never touch
+// the bcrypt path again.
 func (s *Service) VerifyPassword(ctx context.Context, password string) (bool, error) {
 	hash, err := s.settings.Get(ctx, keyPasswordHash)
 	if err != nil {
 		return false, err
 	}
-	return crypto.VerifyPassword(password, hash)
+	ok, err := crypto.VerifyPassword(password, hash)
+	if err != nil || !ok {
+		return ok, err
+	}
+	if crypto.IsLegacyBcrypt(hash) {
+		if newHash, herr := crypto.HashPassword(password); herr == nil {
+			_ = s.settings.Set(ctx, keyPasswordHash, newHash)
+		}
+	}
+	return true, nil
 }
 
 // SetPassword changes the dashboard password.

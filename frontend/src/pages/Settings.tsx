@@ -6,7 +6,7 @@ import {
   Gauge, Eye, EyeOff, KeyRound, Download, Upload, ShieldCheck, Info,
   Palette, Shield,
 } from "lucide-react";
-import { api, type EndpointSettings, type BrandingSettings, type HeadroomTestResult, type ForeignImportResult } from "../lib/api";
+import { api, type EndpointSettings, type BrandingSettings, type HeadroomTestResult, type ForeignImportResult, type N9routerImportOptions, type N9routerAnalyzeResult } from "../lib/api";
 import { ChangelogMarkdown } from "../components/ChangelogMarkdown";
 import { PALETTES, getPaletteScales } from "../lib/palettes";
 import { applyShadeScale, generateShades } from "../lib/color-utils";
@@ -1223,9 +1223,24 @@ function ForeignImportSettings() {
   const toast = useToast();
   const import9rRef = useRef<HTMLInputElement>(null);
   const importOmniRef = useRef<HTMLInputElement>(null);
+  const importSqliteRef = useRef<HTMLInputElement>(null);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<ForeignImportResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [analyze, setAnalyze] = useState<N9routerAnalyzeResult | null>(null);
+  const [pendingSqliteFile, setPendingSqliteFile] = useState<File | null>(null);
+  const [sqliteOptions, setSqliteOptions] = useState<N9routerImportOptions>({
+    usage: true,
+    providers: true,
+    api_keys: true,
+    proxy_pools: true,
+    chains: true,
+    settings: true,
+    password: true,
+    mode: "merge",
+  });
+  const setSection = (key: keyof N9routerImportOptions, v: boolean) =>
+    setSqliteOptions((o) => ({ ...o, [key]: v }));
 
   const runImport = async (source: "9router" | "omniroute", file: File) => {
     setLoading(true);
@@ -1266,6 +1281,57 @@ function ForeignImportSettings() {
     const file = e.target.files?.[0];
     if (file) void runImport("omniroute", file);
     if (importOmniRef.current) importOmniRef.current.value = "";
+  };
+
+  const handleSqliteFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    setAnalyze(null);
+    try {
+      const counts = await api.analyze9routerSQLite(file);
+      setAnalyze(counts);
+      setPendingSqliteFile(file);
+    } catch (err) {
+      setError((err as Error).message || "Analyze failed.");
+      toast.error("Analyze failed", (err as Error).message);
+    } finally {
+      setLoading(false);
+      if (importSqliteRef.current) importSqliteRef.current.value = "";
+    }
+  };
+
+  const runSqliteImport = async () => {
+    if (!pendingSqliteFile) return;
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    try {
+      const res = await api.import9routerSQLite(pendingSqliteFile, sqliteOptions);
+      setResult(res);
+      const parts: string[] = [];
+      if (res.accounts) parts.push(`${res.accounts} account${res.accounts === 1 ? "" : "s"}`);
+      if (res.custom_providers) parts.push(`${res.custom_providers} provider${res.custom_providers === 1 ? "" : "s"}`);
+      if (res.api_keys) parts.push(`${res.api_keys} key${res.api_keys === 1 ? "" : "s"}`);
+      if (res.chains) parts.push(`${res.chains} chain${res.chains === 1 ? "" : "s"}`);
+      if (res.aliases) parts.push(`${res.aliases} alias${res.aliases === 1 ? "" : "es"}`);
+      if (res.proxy_pools) parts.push(`${res.proxy_pools} pool${res.proxy_pools === 1 ? "" : "s"}`);
+      if (res.usage_records) parts.push(`${res.usage_records} usage record${res.usage_records === 1 ? "" : "s"}`);
+      const summary = parts.length ? parts.join(", ") : "nothing";
+      toast.success(
+        "9router SQLite import complete",
+        `${res.imported} record${res.imported === 1 ? "" : "s"} imported (${summary}).${res.skipped ? ` ${res.skipped} skipped.` : ""}`,
+      );
+      setPendingSqliteFile(null);
+      setAnalyze(null);
+    } catch (err) {
+      setError((err as Error).message || "Import failed.");
+      toast.error("Import failed", (err as Error).message);
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -1331,6 +1397,132 @@ function ForeignImportSettings() {
             className="hidden"
             onChange={handleOmniFile}
           />
+        </div>
+
+        {/* 9router SQLite direct import */}
+        <div className="flex flex-col gap-3 rounded-xl border border-[var(--border)] bg-[var(--bg)] p-4 sm:col-span-2">
+          <div className="flex items-center gap-2">
+            <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-accent-100 text-xs font-bold text-accent-700 dark:bg-accent-900/40 dark:text-accent-200">
+              DB
+            </span>
+            <div>
+              <p className="text-sm font-semibold text-[var(--text)]">9router SQLite database</p>
+              <p className="text-[11px] text-[var(--text-muted)]">Full import incl. usage history &amp; settings</p>
+            </div>
+          </div>
+
+          {!analyze && !pendingSqliteFile && (
+            <>
+              <p className="text-xs leading-relaxed text-[var(--text-muted)]">
+                Upload 9router's <code>data.sqlite</code> directly. Imports everything the JSON backup does, plus usage
+                history, token saver settings, routing strategy, and the dashboard password. Analyzes the file first
+                so you can choose exactly which sections to import.
+              </p>
+              <Button variant="ghost" onClick={() => importSqliteRef.current?.click()} disabled={loading} className="w-full">
+                <Upload className="h-4 w-4" />
+                Select 9router data.sqlite
+              </Button>
+              <input
+                ref={importSqliteRef}
+                type="file"
+                accept=".sqlite,.db,application/vnd.sqlite3,application/x-sqlite3"
+                className="hidden"
+                onChange={handleSqliteFile}
+              />
+            </>
+          )}
+
+          {analyze && (
+            <div className="space-y-4">
+              {/* Per-table row counts from the uploaded file */}
+              <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-subtle)] px-4 py-3">
+                <p className="mb-2 text-xs font-semibold uppercase text-[var(--text-muted)]">Detected in file</p>
+                <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs text-[var(--text)]">
+                  {analyze.providerConnections != null && <span>{analyze.providerConnections} providers/accounts</span>}
+                  {analyze.providerNodes != null && <span>{analyze.providerNodes} custom nodes</span>}
+                  {analyze.apiKeys != null && <span>{analyze.apiKeys} API keys</span>}
+                  {analyze.combos != null && <span>{analyze.combos} chains</span>}
+                  {analyze.proxyPools != null && <span>{analyze.proxyPools} proxy pools</span>}
+                  {analyze.usageHistory != null && <span>{analyze.usageHistory.toLocaleString()} usage records</span>}
+                </div>
+              </div>
+
+              {/* Section checkboxes */}
+              <div className="space-y-2">
+                <p className="text-xs font-semibold uppercase text-[var(--text-muted)]">Sections to import</p>
+                <label className="flex items-start gap-2 text-xs text-[var(--text)]">
+                  <input type="checkbox" checked={sqliteOptions.usage} onChange={(e) => setSection("usage", e.target.checked)} className="mt-0.5" />
+                  <span>Usage records <span className="text-[var(--text-muted)]">— token usage, costs, model stats</span></span>
+                </label>
+                <label className="flex items-start gap-2 text-xs text-[var(--text)]">
+                  <input type="checkbox" checked={sqliteOptions.providers} onChange={(e) => setSection("providers", e.target.checked)} className="mt-0.5" />
+                  <span>Providers &amp; accounts <span className="text-[var(--text-muted)]">— connections, custom nodes, credentials re-encrypted</span></span>
+                </label>
+                <label className="flex items-start gap-2 text-xs text-[var(--text)]">
+                  <input type="checkbox" checked={sqliteOptions.api_keys} onChange={(e) => setSection("api_keys", e.target.checked)} className="mt-0.5" />
+                  <span>API keys <span className="text-[var(--text-muted)]">— re-hashed; same key strings keep working</span></span>
+                </label>
+                <label className="flex items-start gap-2 text-xs text-[var(--text)]">
+                  <input type="checkbox" checked={sqliteOptions.proxy_pools} onChange={(e) => setSection("proxy_pools", e.target.checked)} className="mt-0.5" />
+                  <span>Proxy pools <span className="text-[var(--text-muted)]">— Cloudflare / HTTP proxy configs</span></span>
+                </label>
+                <label className="flex items-start gap-2 text-xs text-[var(--text)]">
+                  <input type="checkbox" checked={sqliteOptions.chains} onChange={(e) => setSection("chains", e.target.checked)} className="mt-0.5" />
+                  <span>Routing chains <span className="text-[var(--text-muted)]">— combos → chains (fallback/RR strategies)</span></span>
+                </label>
+                <label className="flex items-start gap-2 text-xs text-[var(--text)]">
+                  <input type="checkbox" checked={sqliteOptions.settings} onChange={(e) => setSection("settings", e.target.checked)} className="mt-0.5" />
+                  <span>Settings <span className="text-[var(--text-muted)]">— token saver (RTK/Caveman/Ponytail), routing strategy</span></span>
+                </label>
+                <label className="flex items-start gap-2 text-xs text-[var(--text)]">
+                  <input type="checkbox" checked={sqliteOptions.password} onChange={(e) => setSection("password", e.target.checked)} className="mt-0.5" />
+                  <span>Dashboard password <span className="text-[var(--text-muted)]">— import 9router's bcrypt hash (triggers re-login)</span></span>
+                </label>
+              </div>
+
+              {/* Mode radio */}
+              <div className="space-y-2">
+                <p className="text-xs font-semibold uppercase text-[var(--text-muted)]">Import mode</p>
+                <label className="flex items-start gap-2 text-xs text-[var(--text)]">
+                  <input type="radio" name="n9mode" value="merge" checked={sqliteOptions.mode === "merge"} onChange={() => setSqliteOptions((o) => ({ ...o, mode: "merge" }))} className="mt-0.5" />
+                  <span>Merge <span className="text-[var(--text-muted)]">— add new rows, skip existing (safe, repeatable)</span></span>
+                </label>
+                <label className="flex items-start gap-2 text-xs text-[var(--text)]">
+                  <input type="radio" name="n9mode" value="overwrite" checked={sqliteOptions.mode === "overwrite"} onChange={() => setSqliteOptions((o) => ({ ...o, mode: "overwrite" }))} className="mt-0.5" />
+                  <span>Overwrite <span className="text-[var(--text-muted)]">— remove previous 9router imports, then re-import (clean sync)</span></span>
+                </label>
+                <label className="flex items-start gap-2 text-xs text-[var(--text)]">
+                  <input type="radio" name="n9mode" value="wipe" checked={sqliteOptions.mode === "wipe"} onChange={() => setSqliteOptions((o) => ({ ...o, mode: "wipe" }))} className="mt-0.5" />
+                  <span>Wipe &amp; replace <span className="text-[var(--text-muted)] font-medium text-red-500">— DESTROYS all selected data including KeiRouter-native rows</span></span>
+                </label>
+                {sqliteOptions.mode === "wipe" && (
+                  <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[11px] text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-300">
+                    ⚠️ Wipe mode deletes ALL rows in the selected sections, not just previously imported ones. A safety
+                    backup is created automatically before any deletion.
+                  </p>
+                )}
+              </div>
+
+              {/* Action buttons */}
+              <div className="flex gap-2">
+                <Button
+                  variant="primary"
+                  onClick={runSqliteImport}
+                  disabled={loading || !Object.values(sqliteOptions).some((v) => typeof v === "boolean" && v)}
+                  className="w-full"
+                >
+                  {loading ? "Importing…" : "Run import"}
+                </Button>
+                <Button
+                  variant="ghost"
+                  onClick={() => { setAnalyze(null); setPendingSqliteFile(null); }}
+                  disabled={loading}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 

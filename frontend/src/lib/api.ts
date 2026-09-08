@@ -1001,8 +1001,22 @@ export interface ForeignImportResult {
   chains: number;
   aliases: number;
   proxy_pools: number;
+  usage_records?: number;
   errors?: string[];
 }
+export interface N9routerImportOptions {
+  usage: boolean;
+  providers: boolean;
+  api_keys: boolean;
+  proxy_pools: boolean;
+  chains: boolean;
+  settings: boolean;
+  password: boolean;
+  mode: "merge" | "overwrite" | "wipe";
+}
+export type N9routerAnalyzeResult = Partial<
+  Record<"providerNodes" | "providerConnections" | "apiKeys" | "combos" | "proxyPools" | "usageHistory", number>
+>;
 
 class APIError extends Error {
   status: number;
@@ -1086,9 +1100,10 @@ async function requestBlob(method: string, path: string): Promise<Blob> {
 }
 
 async function requestForm<T>(method: string, path: string, body: FormData): Promise<T> {
-  // Uploads (e.g. SQLite restore) can legitimately take longer than a JSON
-  // call, so allow a more generous deadline than the default.
-  const res = await fetchWithTimeout(`/api${path}`, { method, body }, 60_000);
+  // Uploads can legitimately take longer than a JSON call: a 9router SQLite
+  // import uploads tens of MB and converts 60k+ usage rows. Use the largest
+  // supported timeout and let callers with smaller payloads finish early.
+  const res = await fetchWithTimeout(`/api${path}`, { method, body }, 300_000);
   if (!res.ok) {
     let message = res.statusText;
     try {
@@ -1432,6 +1447,19 @@ export const api = {
     const body = new FormData();
     body.append("file", file);
     return requestForm<SQLiteRestoreResult>("POST", "/settings/sqlite/restore", body);
+  },
+  // Import 9router SQLite database directly (usageHistory, apiKeys, providers, proxyPools, settings).
+  import9routerSQLite: (file: File, options?: Partial<N9routerImportOptions>) => {
+    const body = new FormData();
+    body.append("file", file);
+    if (options) body.append("options", JSON.stringify(options));
+    return requestForm<ForeignImportResult>("POST", "/settings/database/import-9router-sqlite", body);
+  },
+  // Analyze a 9router SQLite upload: per-table row counts, nothing written.
+  analyze9routerSQLite: (file: File) => {
+    const body = new FormData();
+    body.append("file", file);
+    return requestForm<N9routerAnalyzeResult>("POST", "/settings/database/analyze-9router-sqlite", body);
   },
 
   // Proxy test.
